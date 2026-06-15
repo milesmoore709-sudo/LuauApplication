@@ -1,4 +1,4 @@
--- Disocrd: Localhamster2 Roblox: Localhamster2
+-- Discord: Localhamster2 Roblox: Localhamster2
 -- Weighted A* pathfinding over a tile grid, with diagonal moves and a
 -- binary heap for the open set. Run it and watch the Output window.
 
