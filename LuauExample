@@ -1,1 +1,281 @@
+-- Disocrd: Localhamster2 Roblox: Localhamster2
+-- Weighted A* pathfinding over a tile grid, with diagonal moves and a
+-- binary heap for the open set. Run it and watch the Output window.
 
+local MinHeap = {}
+MinHeap.__index = MinHeap
+
+function MinHeap.new()
+	return setmetatable({ items = {}, size = 0 }, MinHeap)
+end
+
+function MinHeap:isEmpty()
+	return self.size == 0
+end
+
+function MinHeap:push(value, priority)
+	self.size += 1
+	self.items[self.size] = { value = value, priority = priority }
+
+	-- Float the new item up while it's cheaper than its parent.
+	local i = self.size
+	while i > 1 do
+		local parent = i // 2
+		if self.items[parent].priority <= self.items[i].priority then
+			break
+		end
+		self.items[parent], self.items[i] = self.items[i], self.items[parent]
+		i = parent
+	end
+end
+
+function MinHeap:pop()
+	local items = self.items
+	local top = items[1]
+
+	-- Drop the last item onto the root and let it sink back into place.
+	items[1] = items[self.size]
+	items[self.size] = nil
+	self.size -= 1
+
+	local i = 1
+	while true do
+		local left, right = i * 2, i * 2 + 1
+		local smallest = i
+		if left <= self.size and items[left].priority < items[smallest].priority then
+			smallest = left
+		end
+		if right <= self.size and items[right].priority < items[smallest].priority then
+			smallest = right
+		end
+		if smallest == i then
+			break
+		end
+		items[i], items[smallest] = items[smallest], items[i]
+		i = smallest
+	end
+
+	return top.value
+end
+
+-- Tile -> cost. '#' is a wall (handled separately). Other tiles are
+-- walkable but the rough/slow ones cost more to step onto.
+local TERRAIN = { ["."] = 1, [","] = 2, ["~"] = 5, S = 1, G = 1 }
+local DIAGONAL_COST = 1.41421356 -- sqrt(2): a diagonal step covers more ground
+
+local STRAIGHT_DIRS = {
+	Vector2.new(1, 0), Vector2.new(-1, 0),
+	Vector2.new(0, 1), Vector2.new(0, -1),
+}
+local DIAGONAL_DIRS = {
+	Vector2.new(1, 1), Vector2.new(1, -1),
+	Vector2.new(-1, 1), Vector2.new(-1, -1),
+}
+
+local Grid = {}
+Grid.__index = Grid
+
+function Grid.new(rows)
+	local self = setmetatable({}, Grid)
+	self.rows = rows
+	self.height = #rows
+	self.width = #rows[1]
+	self.cost = {}
+
+	-- Read the layout once up front so lookups during the search are cheap.
+	for y = 1, self.height do
+		self.cost[y] = {}
+		for x = 1, self.width do
+			local ch = string.sub(rows[y], x, x)
+			if ch == "#" then
+				self.cost[y][x] = false -- wall
+			else
+				self.cost[y][x] = TERRAIN[ch] or 1
+			end
+			if ch == "S" then
+				self.start = Vector2.new(x, y)
+			elseif ch == "G" then
+				self.goal = Vector2.new(x, y)
+			end
+		end
+	end
+
+	return self
+end
+
+function Grid:inBounds(cell)
+	return cell.X >= 1 and cell.X <= self.width
+		and cell.Y >= 1 and cell.Y <= self.height
+end
+
+function Grid:terrainCost(cell)
+	return self.cost[cell.Y][cell.X]
+end
+
+function Grid:isWalkable(cell)
+	-- Must be on the board and not a wall (walls are stored as false).
+	return self:inBounds(cell) and self:terrainCost(cell) ~= false
+end
+
+function Grid:toId(cell)
+	-- One integer per cell, so it can key the score tables.
+	return (cell.Y - 1) * self.width + cell.X
+end
+
+function Grid:heuristic(a, b)
+	-- Octile distance: the cheapest possible cost over open ground. It never
+	-- guesses too high, which is what keeps A*'s result optimal.
+	local dx = math.abs(a.X - b.X)
+	local dy = math.abs(a.Y - b.Y)
+	local diag = math.min(dx, dy)
+	return (dx + dy - 2 * diag) + DIAGONAL_COST * diag
+end
+
+function Grid:getNeighbors(cell)
+	local result = {}
+
+	for _, dir in ipairs(STRAIGHT_DIRS) do
+		local neighbor = cell + dir
+		if self:isWalkable(neighbor) then
+			table.insert(result, neighbor)
+		end
+	end
+
+	-- Diagonals are only allowed if both tiles they brush past are open,
+	-- otherwise the path would clip through the corner of a wall.
+	for _, dir in ipairs(DIAGONAL_DIRS) do
+		local neighbor = cell + dir
+		local sideA = cell + Vector2.new(dir.X, 0)
+		local sideB = cell + Vector2.new(0, dir.Y)
+		if self:isWalkable(neighbor) and self:isWalkable(sideA) and self:isWalkable(sideB) then
+			table.insert(result, neighbor)
+		end
+	end
+
+	return result
+end
+
+function Grid:moveCost(from, to)
+	-- Pay the destination tile's terrain cost, bumped for diagonal steps.
+	local diagonal = from.X ~= to.X and from.Y ~= to.Y
+	local distance = diagonal and DIAGONAL_COST or 1
+	return distance * self:terrainCost(to)
+end
+
+function Grid:findPath(startCell, goalCell)
+	if not (self:isWalkable(startCell) and self:isWalkable(goalCell)) then
+		return nil
+	end
+
+	local goalId = self:toId(goalCell)
+	local frontier = MinHeap.new()
+	local cameFrom = {} -- id -> the cell we arrived from
+	local gScore = {} -- id -> cheapest cost to reach it so far
+	local settled = {} -- ids we've already finished with
+
+	gScore[self:toId(startCell)] = 0
+	frontier:push(startCell, self:heuristic(startCell, goalCell))
+
+	while not frontier:isEmpty() do
+		local current = frontier:pop()
+		local currentId = self:toId(current)
+
+		if currentId == goalId then
+			return self:reconstruct(cameFrom, current)
+		end
+
+		-- The heap may carry stale copies of a cell; ignore settled ones.
+		if not settled[currentId] then
+			settled[currentId] = true
+
+			for _, neighbor in ipairs(self:getNeighbors(current)) do
+				local neighborId = self:toId(neighbor)
+				local tentative = gScore[currentId] + self:moveCost(current, neighbor)
+
+				-- Keep this route only if it beats the best we'd found before.
+				if tentative < (gScore[neighborId] or math.huge) then
+					gScore[neighborId] = tentative
+					cameFrom[neighborId] = current
+					frontier:push(neighbor, tentative + self:heuristic(neighbor, goalCell))
+				end
+			end
+		end
+	end
+
+	return nil -- frontier emptied without reaching the goal
+end
+
+function Grid:reconstruct(cameFrom, current)
+	-- Follow the breadcrumbs back from the goal, inserting at the front so
+	-- the finished list reads start -> goal.
+	local path = { current }
+	local id = self:toId(current)
+	while cameFrom[id] do
+		current = cameFrom[id]
+		id = self:toId(current)
+		table.insert(path, 1, current)
+	end
+	return path
+end
+
+function Grid:pathCost(path)
+	local total = 0
+	for i = 2, #path do
+		total += self:moveCost(path[i - 1], path[i])
+	end
+	return total
+end
+
+function Grid:render(path)
+	local onPath = {}
+	for _, cell in ipairs(path) do
+		onPath[self:toId(cell)] = true
+	end
+
+	local startId = self:toId(self.start)
+	local goalId = self:toId(self.goal)
+
+	-- Redraw the maze with the chosen route stamped over the top.
+	local lines = {}
+	for y = 1, self.height do
+		local chars = {}
+		for x = 1, self.width do
+			local id = (y - 1) * self.width + x
+			if id == startId then
+				chars[x] = "S"
+			elseif id == goalId then
+				chars[x] = "G"
+			elseif onPath[id] then
+				chars[x] = "*"
+			else
+				chars[x] = string.sub(self.rows[y], x, x)
+			end
+		end
+		lines[y] = table.concat(chars)
+	end
+
+	print(table.concat(lines, "\n"))
+end
+
+-- '.' open ground, ',' rough (2x), '~' slow (5x), '#' wall. The search
+-- should hug the cheap ground and only wade through slow tiles when that's
+-- genuinely the shorter overall route.
+local maze = Grid.new({
+	"S..,,,#.....",
+	".##,#.#.###.",
+	"...,#.~~..#.",
+	".#.#####.##.",
+	".#.,,..#....",
+	".#.#.###.#~~",
+	".#~~.#.#.#..",
+	".#####.#.#..",
+	"...~~......G",
+})
+
+local path = maze:findPath(maze.start, maze.goal)
+if path then
+	print(string.format("Path found: %d tiles, total cost %.2f", #path, maze:pathCost(path)))
+	maze:render(path)
+else
+	warn("No path exists between S and G.")
+end
